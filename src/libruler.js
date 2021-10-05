@@ -6,7 +6,7 @@ import { dragRulerAddWaypointHistory,
 				 dragRulerAbortDrag,
 				 dragRulerRecalculate } from "./ruler.js";
 
-import { cancelScheduledMeasurement } from "./foundry_imports.js";
+import { cancelScheduledMeasurement, calculateEntityOffset, applyOffsetToRay } from "./foundry_imports.js";
 
 export function registerLibRuler() {
 	// Wrappers for base Ruler methods
@@ -23,6 +23,8 @@ export function registerLibRuler() {
 	libWrapper.register(settingsKey, "Ruler.prototype.deferMeasurement", dragRulerDeferMeasurement, "WRAPPER");
 	libWrapper.register(settingsKey, "Ruler.prototype.cancelScheduledMeasurement", dragRulerCancelScheduledMeasurement, "WRAPPER");
 	libWrapper.register(settingsKey, "Ruler.prototype.doDeferredMeasurements", dragRulerDoDeferredMeasurements, "WRAPPER");
+  libWrapper.register(settingsKey, "Ruler.prototype.testForCollision", dragRulerTestForCollision, "MIXED");
+  libWrapper.register(settingsKey, "Ruler.prototype.animateToken", dragRulerAnimateToken, "WRAPPER");
 
 	// Wrappers for libRuler RulerSegment methods
 	libWrapper.register(settingsKey, "window.libRuler.RulerSegment.prototype.addProperties", dragRulerAddProperties, "WRAPPER");
@@ -128,6 +130,30 @@ async function dragRulerDoDeferredMeasurements() {
 }
 
 /*
+ * Wrapper for libRuler Ruler.testForCollision
+ * Don't check for collisions if GM, so that GM can drag tokens through walls.
+ */
+function dragRulerTestForCollision(wrapped, rays) {
+ // taken from foundry_imports.js moveEntities function
+ if(this.isDragRuler) {
+   if(game.user.isGM) return false;
+   const draggedEntity = this._getMovementToken();
+
+   if(draggedEntity instanceof Token) {
+     const selectedEntities = canvas.tokens.controlled;
+     const hasCollision = selectedEntities.some(token => {
+			 const offset = calculateEntityOffset(token, draggedEntity);
+			 const offsetRays = rays.filter(ray => !ray.isPrevious).map(ray => applyOffsetToRay(ray, offset))
+			 return offsetRays.some(r => canvas.walls.checkCollision(r));
+		 });
+		 return hasCollision;
+   }
+ }
+
+ return wrapped(rays);
+}
+
+/*
  * Modify destination to be the snap point for the token when snap is set.
  * Wrap for Ruler.setDestination from libRuler.
  * @param {Object} wrapped	Wrapped function from libWrapper.
@@ -155,19 +181,22 @@ function dragRulerSetDestination(wrapped, destination) {
  *				Handle measured template entity
  */
 async function dragRulerMoveToken(wrapped) {
-	if(!this.isDragRuler) return await wrapped();
-	if(this._state === Ruler.STATES.MOVING) {
-		return await wrapped();
-	} else {
-		let options = {};
-		setSnapParameterOnOptions(this, options);
-
-		if (!game.settings.get(settingsKey, "swapSpacebarRightClick")) {
-			this._addWaypoint(this.destination, options);
-		} else {
-			this.dragRulerDeleteWaypoint(event, options);
-		}
+	if(!this.isDragRuler || this._state === Ruler.STATES.MOVING) {
+		const p1 = wrapped();
+		const res = await p1;
+		return res;
 	}
+
+	let options = {};
+	setSnapParameterOnOptions(this, options);
+
+	if (!game.settings.get(settingsKey, "swapSpacebarRightClick")) {
+		this._addWaypoint(this.destination, options);
+	} else {
+		this.dragRulerDeleteWaypoint(event, options);
+	}
+
+	return undefined;
 }
 
 /*
@@ -199,15 +228,48 @@ export function dragRulerGetRaysFromWaypoints(waypoints, destination) {
  * Wrap for Ruler._getMovementToken()
  */
 
-
-// TO-DO: Deal with multiple selected tokens
 // See drag ruler original version of moveTokens in foundry_imports.js
 function dragRulerGetMovementToken(wrapped) {
 	if(!this.isDragRuler) return wrapped();
 	return this.draggedEntity;
 }
 
-// TO-DO: Deal with multiple selected token animation
+/*
+ * Wrap animate token to adjust ray for multiple tokens
+ */
+async function dragRulerAnimateToken(wrapped, token, ray, dx, dy, segment_num) {
+  let selectedEntities = canvas.tokens.controlled; // should include the dragged entity, right?
+  const isToken = token instanceof Token;
+  const animate = isToken && !game.keyboard.isDown("Alt");
+  selectedEntities = selectedEntities.filter(e => e.id !== token.id); // pull out the dragged token.
+
+  console.log(`drag-ruler|${animate ? "animating" : "not animating"} ${selectedEntities.length} selected tokens with dx, dy ${dx}, ${dy}`, token, selectedEntities)
+
+	// probably don't want to do the following b/c (1) need path from the wrapped function and (2) wrapped function already does the update
+	// await draggedEntity.scene.updateEmbeddedDocuments(draggedEntity.constructor.embeddedName, updates, {animate});
+
+  // animate the selected additional tokens using promises so they move as a group.
+  const promises = [];
+  for(const entity of selectedEntities) {
+    //const top_left = canvas.grid.getTopLeft(entity.center.x, entity.center.y);
+    const offset = { x: entity.center.x - token.center.x, y: entity.center.y - token.center.y };
+    const offsetRay = new Ray(ray.A, { x: ray.B.x + offset.x, y: ray.B.y + offset.y });
+    console.log(`drag-ruler|Animating entity ${entity.name} from ${entity.center.x}, ${entity.center.y} to ${offsetRay.B.x}, ${offsetRay.B.y}. Token ${token.name} at ${token.center.x}, ${token.center.y}. Offset ${offset.x}, ${offset.y}`);
+
+    // don't await here b/c this makes the tokens all move one-by-one
+    promises.push(wrapped(entity, offsetRay, dx, dy, segment_num)); // usually works, but can occassionally fail to keep multiple tokens in original arrangement
+    //promises.push(wrapped(entity, ray, dx + offset.x, dy + offset.y, segment_num)); // Fails to keep tokens in original arrangement much of the time
+  }
+
+  // use Promise.all to await to avoid confusing move errors if moving repeatedly very quickly
+  console.log(`drag-ruler|Animating ${token.name} from ${token.center.x}, ${token.center.y} to ${ray.B.x}, ${ray.B.y}`);
+  promises.push(wrapped(token, ray, dx, dy, segment_num));
+  const res = await Promise.allSettled(promises);
+
+  // need to return the path from the movement for the token
+  console.log("drag-ruler|AnimateToken returns", res);
+  return res[res.length -1].value;  // Promise.allSettled returns an array of [{status: , value: }]; Promise.all returns an array
+}
 
 // Wrappers for libRuler RulerSegment methods
 function dragRulerAddProperties(wrapped) {
